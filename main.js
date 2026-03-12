@@ -102,8 +102,18 @@ class TtsReaderPlugin extends obsidian.Plugin {
     this.addCommand({
       id: "read-selection",
       name: "선택 텍스트 읽기",
-      editorCallback: (editor) => {
-        const selection = editor.getSelection();
+      callback: () => {
+        const view = this.app.workspace.getActiveViewOfType(obsidian.MarkdownView);
+        if (!view) {
+          new obsidian.Notice("열린 마크다운 문서가 없습니다");
+          return;
+        }
+        let selection = "";
+        try {
+          if (view.editor) {
+            selection = view.editor.getSelection();
+          }
+        } catch (e) {}
         if (selection) {
           this.readText(selection);
         } else {
@@ -162,8 +172,34 @@ class TtsReaderPlugin extends obsidian.Plugin {
       new obsidian.Notice("열린 마크다운 문서가 없습니다");
       return;
     }
-    // Reading 모드든 Edit 모드든 에디터에서 텍스트 가져옴
-    const text = view.editor.getValue();
+    // 읽기 모드 + 편집 모드 모두 지원
+    let text = "";
+    try {
+      if (view.editor) {
+        text = view.editor.getValue();
+      }
+    } catch (e) {
+      // 읽기 모드에서 editor 접근 실패
+    }
+    if (!text) {
+      // 읽기 모드: file에서 직접 가져오기
+      try {
+        const file = view.file;
+        if (file) {
+          this.app.vault.cachedRead(file).then((content) => {
+            if (content && content.trim()) {
+              this.readText(content);
+            } else {
+              new obsidian.Notice("문서가 비어있습니다");
+            }
+          });
+          return;
+        }
+      } catch (e) {
+        new obsidian.Notice("문서를 읽을 수 없습니다");
+        return;
+      }
+    }
     if (!text.trim()) {
       new obsidian.Notice("문서가 비어있습니다");
       return;
