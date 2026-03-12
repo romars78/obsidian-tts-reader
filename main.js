@@ -46,10 +46,12 @@ const DEFAULT_SETTINGS = {
 };
 
 // ─── Google Translate TTS 엔진 (모바일용) ───
+// Obsidian requestUrl로 오디오 데이터를 직접 다운로드 → Blob → Audio 재생
 class GoogleTtsEngine {
   constructor(settings) {
     this.settings = settings;
     this.audio = null;
+    this.blobUrl = null;
     this.chunks = [];
     this.currentIndex = 0;
     this.isPlaying = false;
@@ -58,13 +60,10 @@ class GoogleTtsEngine {
     this.onErrorCallback = null;
   }
 
-  // 텍스트를 짧은 청크로 분할 (Google TTS 제한 ~200자)
   splitText(text, maxLen) {
     const chunks = [];
-    // 문장 단위로 나누기
     const sentences = text.split(/(?<=[.?!。！？\n,，])\s*/);
     let current = "";
-
     for (const s of sentences) {
       if (!s.trim()) continue;
       if ((current + s).length > maxLen && current) {
@@ -75,8 +74,6 @@ class GoogleTtsEngine {
       }
     }
     if (current.trim()) chunks.push(current.trim());
-
-    // 여전히 긴 청크가 있으면 강제 분할
     const result = [];
     for (const c of chunks) {
       if (c.length <= maxLen) {
@@ -87,13 +84,7 @@ class GoogleTtsEngine {
         }
       }
     }
-
     return result.length > 0 ? result : [text.substring(0, maxLen)];
-  }
-
-  getTtsUrl(text, lang) {
-    const encoded = encodeURIComponent(text);
-    return "https://translate.google.com/translate_tts?ie=UTF-8&tl=" + lang + "&client=tw-ob&q=" + encoded;
   }
 
   speak(text, onFinish, onError) {
@@ -107,7 +98,7 @@ class GoogleTtsEngine {
     this.playNext();
   }
 
-  playNext() {
+  async playNext() {
     if (!this.isPlaying || this.currentIndex >= this.chunks.length) {
       this.isPlaying = false;
       if (this.onFinishCallback) this.onFinishCallback();
@@ -115,36 +106,52 @@ class GoogleTtsEngine {
     }
 
     const chunk = this.chunks[this.currentIndex];
-    const url = this.getTtsUrl(chunk, this.settings.lang || "ko");
+    const lang = this.settings.lang || "ko";
+    const encoded = encodeURIComponent(chunk);
+    const url = "https://translate.google.com/translate_tts?ie=UTF-8&tl=" + lang + "&client=tw-ob&q=" + encoded;
 
-    this.audio = new Audio(url);
-    this.audio.playbackRate = this.settings.rate || 1.0;
+    try {
+      // Obsidian requestUrl: CORS 우회, 네이티브 HTTP 요청
+      const response = await obsidian.requestUrl({
+        url: url,
+        method: "GET",
+      });
 
-    this.audio.onended = () => {
-      this.currentIndex++;
-      if (this.isPlaying && !this.isPaused) {
-        this.playNext();
+      // ArrayBuffer → Blob → Object URL
+      const blob = new Blob([response.arrayBuffer], { type: "audio/mpeg" });
+
+      // 이전 blob URL 해제
+      if (this.blobUrl) {
+        URL.revokeObjectURL(this.blobUrl);
       }
-    };
+      this.blobUrl = URL.createObjectURL(blob);
 
-    this.audio.onerror = (e) => {
-      console.error("Google TTS audio error:", e);
-      if (this.onErrorCallback) {
-        this.onErrorCallback("오디오 재생 실패 (청크 " + (this.currentIndex + 1) + "/" + this.chunks.length + ")");
-      }
-      // 다음 청크 시도
+      this.audio = new Audio(this.blobUrl);
+      this.audio.playbackRate = this.settings.rate || 1.0;
+
+      this.audio.onended = () => {
+        this.currentIndex++;
+        if (this.isPlaying && !this.isPaused) {
+          this.playNext();
+        }
+      };
+
+      this.audio.onerror = (e) => {
+        console.error("TTS audio playback error:", e);
+        this.currentIndex++;
+        if (this.isPlaying) this.playNext();
+      };
+
+      await this.audio.play();
+
+    } catch (e) {
+      console.error("TTS fetch/play error:", e);
+      // 이 청크 건너뛰고 다음 시도
       this.currentIndex++;
       if (this.isPlaying) {
         this.playNext();
       }
-    };
-
-    this.audio.play().catch((e) => {
-      console.error("Google TTS play error:", e);
-      if (this.onErrorCallback) {
-        this.onErrorCallback("재생 시작 실패: " + e.message);
-      }
-    });
+    }
   }
 
   pause() {
@@ -168,6 +175,10 @@ class GoogleTtsEngine {
       this.audio.pause();
       this.audio.src = "";
       this.audio = null;
+    }
+    if (this.blobUrl) {
+      URL.revokeObjectURL(this.blobUrl);
+      this.blobUrl = null;
     }
     this.chunks = [];
     this.currentIndex = 0;
