@@ -43,19 +43,21 @@ const DEFAULT_SETTINGS = {
   pitch: 1.0,
   voiceName: "",
   lang: "ko",
+  ttsServerUrl: "http://100.69.168.49:8130",
+  edgeTtsVoice: "ko-KR-SunHiNeural",
 };
 
-// ─── Google Translate TTS 엔진 (모바일용) ───
-// Obsidian requestUrl로 오디오 데이터를 직접 다운로드 → Blob → Audio 재생
-class GoogleTtsEngine {
+// ─── Edge TTS 서버 엔진 (모바일용) ───
+// PC의 Edge TTS 서버에 요청 → 오디오 다운로드 → AudioContext로 재생
+class EdgeTtsEngine {
   constructor(settings) {
     this.settings = settings;
-    this.audio = null;
-    this.blobUrl = null;
-    this.chunks = [];
-    this.currentIndex = 0;
+    this.audioCtx = null;
+    this.source = null;
     this.isPlaying = false;
     this.isPaused = false;
+    this.chunks = [];
+    this.currentIndex = 0;
     this.onFinishCallback = null;
     this.onErrorCallback = null;
   }
@@ -89,7 +91,8 @@ class GoogleTtsEngine {
 
   speak(text, onFinish, onError) {
     this.stop();
-    this.chunks = this.splitText(text, 180);
+    // Edge TTS는 긴 텍스트도 가능하지만, 청크로 나눠서 연속 재생
+    this.chunks = this.splitText(text, 500);
     this.currentIndex = 0;
     this.isPlaying = true;
     this.isPaused = false;
@@ -106,96 +109,65 @@ class GoogleTtsEngine {
     }
 
     const chunk = this.chunks[this.currentIndex];
-    const lang = this.settings.lang || "ko";
-    const encoded = encodeURIComponent(chunk);
-    const url = "https://translate.google.com/translate_tts?ie=UTF-8&tl=" + lang + "&client=tw-ob&q=" + encoded;
+    const serverUrl = this.settings.ttsServerUrl || "http://100.69.168.49:8130";
+    const voice = this.settings.edgeTtsVoice || "ko-KR-SunHiNeural";
 
-    // 첫 청크에서만 디버그 알림 표시
-    const isFirst = this.currentIndex === 0;
+    // 속도 변환 (1.0 → "+0%", 1.5 → "+50%", 0.75 → "-25%")
+    const ratePercent = Math.round((this.settings.rate - 1.0) * 100);
+    const rateStr = (ratePercent >= 0 ? "+" : "") + ratePercent + "%";
 
     try {
-      if (isFirst) new obsidian.Notice("[1] 오디오 다운로드 중...");
-
       const response = await obsidian.requestUrl({
-        url: url,
-        method: "GET",
+        url: serverUrl + "/tts",
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: chunk, voice: voice, rate: rateStr }),
       });
 
-      if (isFirst) new obsidian.Notice("[2] 다운로드 완료: " + response.arrayBuffer.byteLength + " bytes");
+      // AudioContext로 재생
+      this.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      const arrayBuf = response.arrayBuffer.slice(0);
+      const audioBuffer = await this.audioCtx.decodeAudioData(arrayBuf);
 
-      // ArrayBuffer → Blob → Object URL
-      const blob = new Blob([response.arrayBuffer], { type: "audio/mpeg" });
-      if (this.blobUrl) URL.revokeObjectURL(this.blobUrl);
-      this.blobUrl = URL.createObjectURL(blob);
+      this.source = this.audioCtx.createBufferSource();
+      this.source.buffer = audioBuffer;
+      this.source.connect(this.audioCtx.destination);
 
-      if (isFirst) new obsidian.Notice("[3] Blob URL 생성 완료");
-
-      // 방법 1: AudioContext (WebView 호환성 높음)
-      try {
-        const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-        const arrayBuf = response.arrayBuffer.slice(0);
-        const audioBuffer = await audioCtx.decodeAudioData(arrayBuf);
-        const source = audioCtx.createBufferSource();
-        source.buffer = audioBuffer;
-        source.playbackRate.value = this.settings.rate || 1.0;
-        source.connect(audioCtx.destination);
-
-        if (isFirst) new obsidian.Notice("[4] AudioContext 재생 시작");
-
-        source.onended = () => {
-          this.currentIndex++;
-          if (this.isPlaying && !this.isPaused) {
-            this.playNext();
-          }
-        };
-
-        source.start(0);
-        this.audio = { _source: source, _ctx: audioCtx, pause: () => audioCtx.suspend(), resume: () => audioCtx.resume() };
-        return;
-
-      } catch (acErr) {
-        if (isFirst) new obsidian.Notice("[4] AudioContext 실패: " + acErr.message + "\nAudio 시도...");
-      }
-
-      // 방법 2: Audio 엘리먼트 (fallback)
-      this.audio = new Audio(this.blobUrl);
-      this.audio.playbackRate = this.settings.rate || 1.0;
-
-      this.audio.onended = () => {
+      this.source.onended = () => {
         this.currentIndex++;
         if (this.isPlaying && !this.isPaused) {
           this.playNext();
         }
       };
 
-      this.audio.onerror = (e) => {
-        if (isFirst) new obsidian.Notice("[5] Audio 재생 오류");
-        this.currentIndex++;
-        if (this.isPlaying) this.playNext();
-      };
-
-      await this.audio.play();
-      if (isFirst) new obsidian.Notice("[5] Audio 재생 시작");
+      this.source.start(0);
 
     } catch (e) {
-      if (isFirst) new obsidian.Notice("오류: " + e.message, 10000);
-      this.currentIndex++;
-      if (this.isPlaying) {
-        this.playNext();
+      console.error("Edge TTS error:", e);
+      if (this.currentIndex === 0) {
+        // 첫 청크에서 실패하면 서버 연결 문제
+        if (this.onErrorCallback) {
+          this.onErrorCallback("TTS 서버 연결 실패\n" + (this.settings.ttsServerUrl || "") + "\n" + e.message);
+        }
+        this.isPlaying = false;
+        return;
       }
+      // 중간 청크 실패는 건너뛰기
+      this.currentIndex++;
+      if (this.isPlaying) this.playNext();
     }
   }
 
   pause() {
-    if (this.audio && this.isPlaying) {
-      this.audio.pause();
+    if (this.audioCtx && this.isPlaying) {
+      this.audioCtx.suspend();
       this.isPaused = true;
     }
   }
 
   resume() {
-    if (this.audio && this.isPaused) {
-      this.audio.play();
+    if (this.audioCtx && this.isPaused) {
+      this.audioCtx.resume();
       this.isPaused = false;
     }
   }
@@ -203,14 +175,13 @@ class GoogleTtsEngine {
   stop() {
     this.isPlaying = false;
     this.isPaused = false;
-    if (this.audio) {
-      this.audio.pause();
-      this.audio.src = "";
-      this.audio = null;
+    if (this.source) {
+      try { this.source.stop(); } catch (e) {}
+      this.source = null;
     }
-    if (this.blobUrl) {
-      URL.revokeObjectURL(this.blobUrl);
-      this.blobUrl = null;
+    if (this.audioCtx) {
+      try { this.audioCtx.close(); } catch (e) {}
+      this.audioCtx = null;
     }
     this.chunks = [];
     this.currentIndex = 0;
@@ -335,19 +306,19 @@ class TtsReaderPlugin extends obsidian.Plugin {
     this.engine = null;
     this.statusBarEl = null;
     this.ribbonPlayEl = null;
-    this.useGoogleTts = false;
+    this.useEdgeTts = false;
   }
 
   async onload() {
     await this.loadSettings();
 
-    // 엔진 선택: speechSynthesis 있으면 WebSpeech, 없으면 Google TTS
+    // 엔진 선택: speechSynthesis 있으면 WebSpeech, 없으면 Edge TTS 서버
     if (typeof window !== "undefined" && window.speechSynthesis) {
       this.engine = new WebSpeechEngine(this.settings);
-      this.useGoogleTts = false;
+      this.useEdgeTts = false;
     } else {
-      this.engine = new GoogleTtsEngine(this.settings);
-      this.useGoogleTts = true;
+      this.engine = new EdgeTtsEngine(this.settings);
+      this.useEdgeTts = true;
     }
 
     // 리본 아이콘
@@ -420,7 +391,7 @@ class TtsReaderPlugin extends obsidian.Plugin {
     });
 
     this.addSettingTab(new TtsSettingTab(this.app, this));
-    console.log("TTS Reader loaded (engine: " + (this.useGoogleTts ? "Google TTS" : "Web Speech") + ")");
+    console.log("TTS Reader loaded (engine: " + (this.useEdgeTts ? "Edge TTS 서버" : "Web Speech") + ")");
   }
 
   onunload() {
@@ -445,10 +416,14 @@ class TtsReaderPlugin extends obsidian.Plugin {
     const isMobile = obsidian.Platform && obsidian.Platform.isMobile;
     lines.push("플랫폼: " + (isMobile ? "모바일" : "데스크탑"));
     lines.push("speechSynthesis: " + (window.speechSynthesis ? "있음" : "없음"));
-    lines.push("엔진: " + (this.useGoogleTts ? "Google TTS" : "Web Speech"));
-    lines.push("Audio 지원: " + (typeof Audio !== "undefined" ? "있음" : "없음"));
+    lines.push("엔진: " + (this.useEdgeTts ? "Edge TTS 서버" : "Web Speech"));
+    if (this.useEdgeTts) {
+      lines.push("서버: " + (this.settings.ttsServerUrl || "미설정"));
+      lines.push("음성: " + (this.settings.edgeTtsVoice || "미설정"));
+    }
+    lines.push("AudioContext: " + (window.AudioContext || window.webkitAudioContext ? "있음" : "없음"));
 
-    if (!this.useGoogleTts && window.speechSynthesis) {
+    if (!this.useEdgeTts && window.speechSynthesis) {
       const voices = window.speechSynthesis.getVoices();
       lines.push("음성 수: " + voices.length);
       const ko = voices.filter((v) => v.lang.startsWith("ko"));
@@ -511,7 +486,7 @@ class TtsReaderPlugin extends obsidian.Plugin {
       return;
     }
 
-    const engineName = this.useGoogleTts ? "Google TTS" : "Web Speech";
+    const engineName = this.useEdgeTts ? "Edge TTS 서버" : "Web Speech";
     new obsidian.Notice("읽기 시작 (" + engineName + ")");
     this.updateStatusBar();
     this.updateRibbonIcon();
@@ -598,9 +573,40 @@ class TtsSettingTab extends obsidian.PluginSettingTab {
 
     // 현재 엔진 표시
     containerEl.createEl("p", {
-      text: "현재 엔진: " + (this.plugin.useGoogleTts ? "Google TTS (모바일)" : "Web Speech API (데스크탑)"),
+      text: "현재 엔진: " + (this.plugin.useEdgeTts ? "Edge TTS 서버 (모바일)" : "Web Speech API (데스크탑)"),
       cls: "setting-item-description",
     });
+
+    // Edge TTS 서버 설정 (모바일)
+    if (this.plugin.useEdgeTts) {
+      new obsidian.Setting(containerEl)
+        .setName("TTS 서버 주소")
+        .setDesc("Edge TTS 서버 URL (예: http://100.69.168.49:8130)")
+        .addText((text) =>
+          text
+            .setPlaceholder("http://100.69.168.49:8130")
+            .setValue(this.plugin.settings.ttsServerUrl)
+            .onChange(async (value) => {
+              this.plugin.settings.ttsServerUrl = value;
+              await this.plugin.saveSettings();
+            })
+        );
+
+      new obsidian.Setting(containerEl)
+        .setName("음성")
+        .setDesc("ko-KR-SunHiNeural (여성) / ko-KR-InJoonNeural (남성)")
+        .addDropdown((dropdown) => {
+          dropdown.addOption("ko-KR-SunHiNeural", "한국어 여성 (SunHi)");
+          dropdown.addOption("ko-KR-InJoonNeural", "한국어 남성 (InJoon)");
+          dropdown.addOption("en-US-JennyNeural", "영어 여성 (Jenny)");
+          dropdown.addOption("en-US-GuyNeural", "영어 남성 (Guy)");
+          dropdown.setValue(this.plugin.settings.edgeTtsVoice);
+          dropdown.onChange(async (value) => {
+            this.plugin.settings.edgeTtsVoice = value;
+            await this.plugin.saveSettings();
+          });
+        });
+    }
 
     // 속도
     new obsidian.Setting(containerEl)
@@ -618,7 +624,7 @@ class TtsSettingTab extends obsidian.PluginSettingTab {
       );
 
     // 피치 (Web Speech만)
-    if (!this.plugin.useGoogleTts) {
+    if (!this.plugin.useEdgeTts) {
       new obsidian.Setting(containerEl)
         .setName("음높이 (pitch)")
         .setDesc("0.5 ~ 2.0 (기본: 1.0)")
