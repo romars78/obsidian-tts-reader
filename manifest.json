@@ -1,7 +1,7 @@
 {
   "id": "obsidian-tts-reader",
   "name": "TTS Reader",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "minAppVersion": "1.0.0",
   "description": "문서를 소리내어 읽어주는 TTS 플러그인 (한국어/영어/한자 지원, 모바일 호환)",
   "author": "doctor1",
