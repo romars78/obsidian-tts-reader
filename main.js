@@ -110,22 +110,54 @@ class GoogleTtsEngine {
     const encoded = encodeURIComponent(chunk);
     const url = "https://translate.google.com/translate_tts?ie=UTF-8&tl=" + lang + "&client=tw-ob&q=" + encoded;
 
+    // 첫 청크에서만 디버그 알림 표시
+    const isFirst = this.currentIndex === 0;
+
     try {
-      // Obsidian requestUrl: CORS 우회, 네이티브 HTTP 요청
+      if (isFirst) new obsidian.Notice("[1] 오디오 다운로드 중...");
+
       const response = await obsidian.requestUrl({
         url: url,
         method: "GET",
       });
 
+      if (isFirst) new obsidian.Notice("[2] 다운로드 완료: " + response.arrayBuffer.byteLength + " bytes");
+
       // ArrayBuffer → Blob → Object URL
       const blob = new Blob([response.arrayBuffer], { type: "audio/mpeg" });
-
-      // 이전 blob URL 해제
-      if (this.blobUrl) {
-        URL.revokeObjectURL(this.blobUrl);
-      }
+      if (this.blobUrl) URL.revokeObjectURL(this.blobUrl);
       this.blobUrl = URL.createObjectURL(blob);
 
+      if (isFirst) new obsidian.Notice("[3] Blob URL 생성 완료");
+
+      // 방법 1: AudioContext (WebView 호환성 높음)
+      try {
+        const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        const arrayBuf = response.arrayBuffer.slice(0);
+        const audioBuffer = await audioCtx.decodeAudioData(arrayBuf);
+        const source = audioCtx.createBufferSource();
+        source.buffer = audioBuffer;
+        source.playbackRate.value = this.settings.rate || 1.0;
+        source.connect(audioCtx.destination);
+
+        if (isFirst) new obsidian.Notice("[4] AudioContext 재생 시작");
+
+        source.onended = () => {
+          this.currentIndex++;
+          if (this.isPlaying && !this.isPaused) {
+            this.playNext();
+          }
+        };
+
+        source.start(0);
+        this.audio = { _source: source, _ctx: audioCtx, pause: () => audioCtx.suspend(), resume: () => audioCtx.resume() };
+        return;
+
+      } catch (acErr) {
+        if (isFirst) new obsidian.Notice("[4] AudioContext 실패: " + acErr.message + "\nAudio 시도...");
+      }
+
+      // 방법 2: Audio 엘리먼트 (fallback)
       this.audio = new Audio(this.blobUrl);
       this.audio.playbackRate = this.settings.rate || 1.0;
 
@@ -137,16 +169,16 @@ class GoogleTtsEngine {
       };
 
       this.audio.onerror = (e) => {
-        console.error("TTS audio playback error:", e);
+        if (isFirst) new obsidian.Notice("[5] Audio 재생 오류");
         this.currentIndex++;
         if (this.isPlaying) this.playNext();
       };
 
       await this.audio.play();
+      if (isFirst) new obsidian.Notice("[5] Audio 재생 시작");
 
     } catch (e) {
-      console.error("TTS fetch/play error:", e);
-      // 이 청크 건너뛰고 다음 시도
+      if (isFirst) new obsidian.Notice("오류: " + e.message, 10000);
       this.currentIndex++;
       if (this.isPlaying) {
         this.playNext();
